@@ -1,9 +1,8 @@
 #!/bin/bash
-
 # ==============================================
-# SOCKS5 服务器管理脚本 (支持 IPv4/IPv6)
-# 版本: 2.1
-# 支持系统: Debian/Ubuntu/Alpine
+# SOCKS5 服务器一键部署脚本 (IPv4/IPv6双栈)
+# 版本: 3.0
+# 特点: 自动修复+智能诊断+多系统支持
 # ==============================================
 
 # 颜色定义
@@ -14,134 +13,103 @@ BLUE='\033[0;34m'
 CYAN='\033[0;36m'
 NC='\033[0m'
 
-# 配置文件路径
+# 全局配置
 CONFIG_FILE="/etc/socks5/config.json"
 SERVICE_FILE="/etc/systemd/system/socks5.service"
 LOG_FILE="/var/log/socks5.log"
+BIN_PATH="/usr/local/bin/microsocks"
 
-# 默认值
-DEFAULT_PORT=$(shuf -i 20000-60000 -n 1)
-DEFAULT_USER="user_$(openssl rand -hex 3)"
-DEFAULT_PASS=$(openssl rand -hex 8)
-DEFAULT_IPV4="0.0.0.0"
-DEFAULT_IPV6="::"
+# 初始化安装
+init_install() {
+    # 检测root权限
+    [ "$(id -u)" != "0" ] && echo -e "${RED}错误: 必须使用root权限运行!${NC}" && exit 1
 
-# 检查 root 权限
-check_root() {
-    if [ "$(id -u)" != "0" ]; then
-        echo -e "${RED}错误: 此脚本必须使用 root 权限运行!${NC}" >&2
-        exit 1
-    fi
-}
-
-# 检测系统
-detect_os() {
-    if [ -f /etc/alpine-release ]; then
-        echo "alpine"
-    elif [ -f /etc/debian_version ]; then
-        echo "debian"
-    elif [ -f /etc/lsb-release ] && grep -q "Ubuntu" /etc/lsb-release; then
-        echo "ubuntu"
+    # 安装依赖
+    echo -e "${CYAN}>>> 正在安装系统依赖...${NC}"
+    if grep -qi "alpine" /etc/os-release; then
+        apk update && apk add wget unzip jq curl make gcc
+    elif grep -qi "ubuntu\|debian" /etc/os-release; then
+        apt update && apt install -y wget unzip jq curl make gcc
     else
-        echo "unknown"
+        echo -e "${YELLOW}警告: 未知系统，尝试通用安装...${NC}"
+        if ! command -v make >/dev/null; then
+            echo -e "${RED}错误: 必须手动安装make工具${NC}"
+            exit 1
+        fi
     fi
+
+    # 安装microsocks
+    install_microsocks
 }
 
-# 安装依赖
-install_dependencies() {
-    local os_type=$1
-    echo -e "${CYAN}正在安装系统依赖...${NC}"
-    
-    case "$os_type" in
-        debian|ubuntu)
-            apt-get update
-            apt-get install -y wget unzip jq
-            ;;
-        alpine)
-            apk update
-            apk add wget unzip jq
-            ;;
-        *)
-            echo -e "${YELLOW}未知系统，请手动安装依赖: wget unzip jq${NC}"
-            ;;
-    esac
-}
-
-# 安装 microsocks
+# 安装核心组件
 install_microsocks() {
-    echo -e "${CYAN}正在安装 microsocks...${NC}"
-    
-    if [ -x "$(command -v microsocks)" ]; then
-        echo -e "${GREEN}microsocks 已安装${NC}"
-        return
-    fi
+    echo -e "${CYAN}>>> 正在部署microsocks...${NC}"
+    rm -f "$BIN_PATH"
 
-    # 尝试从源码安装
-    if ! wget https://github.com/rofl0r/microsocks/archive/refs/heads/master.zip -O /tmp/microsocks.zip || \
-       ! unzip /tmp/microsocks.zip -d /tmp/ || \
-       ! cd /tmp/microsocks-master || \
-       ! make; then
-        echo -e "${RED}源码安装失败，尝试预编译版本...${NC}"
-        
-        # 根据架构下载预编译版本
+    # 自动选择最佳安装方式
+    if [ -f "/etc/alpine-release" ]; then
+        # Alpine优先使用预编译
         case "$(uname -m)" in
-            x86_64)
-                wget https://github.com/rofl0r/microsocks/releases/download/v1.0.3/microsocks-x86_64-linux-gnu -O /usr/local/bin/microsocks
-                ;;
-            aarch64|arm64)
-                wget https://github.com/rofl0r/microsocks/releases/download/v1.0.3/microsocks-aarch64-linux-gnu -O /usr/local/bin/microsocks
-                ;;
-            *)
-                echo -e "${RED}不支持的架构: $(uname -m)${NC}"
-                exit 1
-                ;;
+            x86_64) BIN_URL="https://github.com/rofl0r/microsocks/releases/download/v1.0.3/microsocks-x86_64-linux-gnu" ;;
+            aarch64) BIN_URL="https://github.com/rofl0r/microsocks/releases/download/v1.0.3/microsocks-aarch64-linux-gnu" ;;
+            *) compile_from_source ;;
         esac
-        
-        chmod +x /usr/local/bin/microsocks
+        wget "$BIN_URL" -O "$BIN_PATH" || compile_from_source
     else
-        cp microsocks /usr/local/bin/
-        cd ..
-        rm -rf /tmp/microsocks-master /tmp/microsocks.zip
+        # 其他系统尝试编译
+        compile_from_source
     fi
 
-    if ! command -v microsocks &>/dev/null; then
-        echo -e "${RED}microsocks 安装失败!${NC}"
+    chmod +x "$BIN_PATH"
+    if [ ! -x "$BIN_PATH" ]; then
+        echo -e "${RED}错误: microsocks安装失败!${NC}"
         exit 1
     fi
-    echo -e "${GREEN}microsocks 安装成功${NC}"
+    echo -e "${GREEN}microsocks安装成功${NC}"
 }
 
-# 创建配置文件
-create_config() {
+# 源码编译
+compile_from_source() {
+    echo -e "${YELLOW}尝试从源码编译...${NC}"
+    tmp_dir=$(mktemp -d)
+    wget https://github.com/rofl0r/microsocks/archive/refs/heads/master.zip -O "$tmp_dir/microsocks.zip" || {
+        echo -e "${RED}下载源码失败!${NC}"; exit 1
+    }
+    unzip "$tmp_dir/microsocks.zip" -d "$tmp_dir" && cd "$tmp_dir/microsocks-master" || {
+        echo -e "${RED}解压失败!${NC}"; exit 1
+    }
+    make && cp microsocks "$BIN_PATH" || {
+        echo -e "${RED}编译失败!${NC}"; exit 1
+    }
+    rm -rf "$tmp_dir"
+}
+
+# 配置防火墙
+config_firewall() {
     local port=$1
-    local user=$2
-    local pass=$3
+    echo -e "${CYAN}>>> 配置防火墙规则...${NC}"
     
-    echo -e "${CYAN}正在创建配置文件...${NC}"
-    mkdir -p /etc/socks5
-    
-    cat > "$CONFIG_FILE" <<EOF
-{
-    "port": $port,
-    "ipv4": "$DEFAULT_IPV4",
-    "ipv6": "$DEFAULT_IPV6",
-    "username": "$user",
-    "password": "$pass"
-}
-EOF
-
-    echo -e "${GREEN}配置文件已创建: $CONFIG_FILE${NC}"
+    # 自动检测防火墙类型
+    if command -v ufw >/dev/null; then
+        ufw allow "$port"/tcp
+        ufw reload
+    elif command -v firewall-cmd >/dev/null; then
+        firewall-cmd --permanent --add-port="$port"/tcp
+        firewall-cmd --reload
+    elif [ -f "/etc/alpine-release" ]; then
+        iptables -A INPUT -p tcp --dport "$port" -j ACCEPT
+        service iptables save
+    else
+        echo -e "${YELLOW}警告: 未检测到支持的防火墙工具，请手动放行端口${NC}"
+    fi
 }
 
-# 创建 systemd 服务
+# 创建服务
 create_service() {
-    echo -e "${CYAN}正在创建系统服务...${NC}"
-    
-    local config=$(cat "$CONFIG_FILE")
-    local port=$(jq -r '.port' <<< "$config")
-    local user=$(jq -r '.username' <<< "$config")
-    local pass=$(jq -r '.password' <<< "$config")
-    
+    local port=$1 user=$2 pass=$3
+    echo -e "${CYAN}>>> 创建系统服务...${NC}"
+
     cat > "$SERVICE_FILE" <<EOF
 [Unit]
 Description=SOCKS5 Proxy Server
@@ -150,11 +118,12 @@ After=network.target
 [Service]
 Type=simple
 User=root
-ExecStart=/usr/local/bin/microsocks -i ${DEFAULT_IPV4} -6 ${DEFAULT_IPV6} -p ${port} -u ${user} -P ${pass}
+ExecStart=$BIN_PATH -i 0.0.0.0 -6 :: -p $port -u $user -P $pass
 Restart=always
 RestartSec=10
-StandardOutput=file:${LOG_FILE}
-StandardError=file:${LOG_FILE}
+StandardOutput=file:$LOG_FILE
+StandardError=file:$LOG_FILE
+LimitNOFILE=65535
 
 [Install]
 WantedBy=multi-user.target
@@ -163,190 +132,132 @@ EOF
     systemctl daemon-reload
     systemctl enable socks5
     systemctl restart socks5
-    
-    echo -e "${GREEN}服务已创建并启动${NC}"
 }
 
-# 显示配置信息
-show_config() {
-    if [ ! -f "$CONFIG_FILE" ]; then
-        echo -e "${RED}未找到配置文件，请先安装服务!${NC}"
-        return
+# 健康检查
+health_check() {
+    local port=$1 user=$2 pass=$3
+    echo -e "${CYAN}>>> 运行健康检查...${NC}"
+
+    # 检查服务状态
+    if ! systemctl is-active socks5 >/dev/null; then
+        echo -e "${RED}错误: 服务未运行!${NC}"
+        journalctl -u socks5 -n 20 --no-pager
+        return 1
     fi
-    
-    local config=$(cat "$CONFIG_FILE")
-    local port=$(jq -r '.port' <<< "$config")
-    local user=$(jq -r '.username' <<< "$config")
-    local pass=$(jq -r '.password' <<< "$config")
-    
-    local public_ipv4=$(curl -s4 ifconfig.co || echo "未知")
-    local public_ipv6=$(curl -s6 ifconfig.co || echo "未知")
-    
-    echo -e "\n${GREEN}============== SOCKS5 配置信息 ==============${NC}"
-    echo -e "${CYAN}服务器IPv4:${NC} $public_ipv4"
-    echo -e "${CYAN}服务器IPv6:${NC} $public_ipv6"
+
+    # 检查端口监听
+    if ! ss -tulnp | grep -q ":$port"; then
+        echo -e "${RED}错误: 端口未监听!${NC}"
+        return 1
+    fi
+
+    # 测试本地连接
+    if ! curl --socks5 "127.0.0.1:$port" --proxy-user "$user:$pass" -sSf https://ifconfig.co --connect-timeout 5 >/dev/null; then
+        echo -e "${RED}错误: 本地连接测试失败!${NC}"
+        tail -n 20 "$LOG_FILE"
+        return 1
+    fi
+
+    echo -e "${GREEN}所有检查通过!${NC}"
+    return 0
+}
+
+# 显示配置
+show_config() {
+    local port=$1 user=$2 pass=$3
+    echo -e "\n${GREEN}========== 部署成功 ==========${NC}"
+    echo -e "${CYAN}服务器IP:${NC} $(curl -s4 ifconfig.co || curl -s6 ifconfig.co || echo '未知')"
     echo -e "${CYAN}端口:${NC} $port"
     echo -e "${CYAN}用户名:${NC} $user"
     echo -e "${CYAN}密码:${NC} $pass"
+    echo -e "${CYAN}日志文件:${NC} $LOG_FILE"
     
-    echo -e "\n${YELLOW}客户端连接格式:${NC}"
-    echo -e "socks5://${user}:${pass}@${public_ipv4}:${port}"
+    echo -e "\n${YELLOW}测试命令:${NC}"
+    echo "curl --socks5-hostname IP:$port --proxy-user $user:$pass https://ifconfig.co"
     
-    echo -e "\n${YELLOW}cURL测试命令:${NC}"
-    echo -e "curl --socks5-hostname ${public_ipv4}:${port} --proxy-user ${user}:${pass} https://example.com"
-    
-    echo -e "\n${GREEN}===========================================${NC}"
+    echo -e "\n${GREEN}============================${NC}"
 }
 
-# 修改配置
-modify_config() {
-    if [ ! -f "$CONFIG_FILE" ]; then
-        echo -e "${RED}未找到配置文件，请先安装服务!${NC}"
-        return
+# 主安装流程
+main_install() {
+    init_install
+
+    # 交互式配置
+    echo -e "\n${BLUE}>>> SOCKS5服务器配置向导${NC}"
+    read -p "输入监听端口 [默认: $(shuf -i 20000-60000 -n 1)]: " port
+    port=${port:-$(shuf -i 20000-60000 -n 1)}
+    
+    read -p "输入用户名 [默认: user_$(openssl rand -hex 3)]: " user
+    user=${user:-user_$(openssl rand -hex 3)}
+    
+    read -p "输入密码 [默认: $(openssl rand -hex 8)]: " pass
+    pass=${pass:-$(openssl rand -hex 8)}
+
+    # 执行安装
+    config_firewall "$port"
+    create_service "$port" "$user" "$pass"
+    
+    # 验证安装
+    if health_check "$port" "$user" "$pass"; then
+        show_config "$port" "$user" "$pass"
+    else
+        echo -e "${RED}安装遇到问题，请检查日志${NC}"
+        exit 1
     fi
-    
-    local config=$(cat "$CONFIG_FILE")
-    local current_port=$(jq -r '.port' <<< "$config")
-    local current_user=$(jq -r '.username' <<< "$config")
-    local current_pass=$(jq -r '.password' <<< "$config")
-    
-    echo -e "\n${CYAN}当前配置:${NC}"
-    echo -e "1. 端口: $current_port"
-    echo -e "2. 用户名: $current_user"
-    echo -e "3. 密码: $current_pass"
-    echo -e "4. 返回主菜单"
-    
-    read -p "请选择要修改的选项 (1-4): " choice
-    
-    case $choice in
-        1)
-            read -p "请输入新端口 (当前: $current_port): " new_port
-            if [[ "$new_port" =~ ^[0-9]+$ ]] && [ "$new_port" -ge 1 ] && [ "$new_port" -le 65535 ]; then
-                jq ".port = $new_port" "$CONFIG_FILE" > /tmp/socks5_config.tmp && mv /tmp/socks5_config.tmp "$CONFIG_FILE"
-                systemctl restart socks5
-                echo -e "${GREEN}端口已修改为 $new_port${NC}"
-            else
-                echo -e "${RED}无效的端口号!${NC}"
-            fi
-            ;;
-        2)
-            read -p "请输入新用户名 (当前: $current_user): " new_user
-            if [ -n "$new_user" ]; then
-                jq ".username = \"$new_user\"" "$CONFIG_FILE" > /tmp/socks5_config.tmp && mv /tmp/socks5_config.tmp "$CONFIG_FILE"
-                systemctl restart socks5
-                echo -e "${GREEN}用户名已修改为 $new_user${NC}"
-            else
-                echo -e "${RED}用户名不能为空!${NC}"
-            fi
-            ;;
-        3)
-            read -p "请输入新密码 (当前: $current_pass): " new_pass
-            if [ -n "$new_pass" ]; then
-                jq ".password = \"$new_pass\"" "$CONFIG_FILE" > /tmp/socks5_config.tmp && mv /tmp/socks5_config.tmp "$CONFIG_FILE"
-                systemctl restart socks5
-                echo -e "${GREEN}密码已修改${NC}"
-            else
-                echo -e "${RED}密码不能为空!${NC}"
-            fi
-            ;;
-        4)
-            return
-            ;;
-        *)
-            echo -e "${RED}无效选择!${NC}"
-            ;;
-    esac
-    
-    # 递归调用以继续修改
-    modify_config
 }
 
-# 卸载服务
+# 卸载功能
 uninstall() {
-    echo -e "${RED}正在卸载 SOCKS5 服务...${NC}"
-    
+    echo -e "${RED}>>> 正在卸载SOCKS5服务...${NC}"
     systemctl stop socks5 2>/dev/null
     systemctl disable socks5 2>/dev/null
     rm -f "$SERVICE_FILE"
     systemctl daemon-reload
-    
-    rm -f /usr/local/bin/microsocks
-    rm -rf /etc/socks5
-    rm -f "$LOG_FILE"
-    
-    echo -e "${GREEN}SOCKS5 服务已卸载${NC}"
+    rm -f "$BIN_PATH"
+    echo -e "${GREEN}已卸载SOCKS5服务${NC}"
 }
 
-# 安装服务
-install() {
-    check_root
-    local os_type=$(detect_os)
+# 诊断功能
+diagnose() {
+    echo -e "${CYAN}>>> 开始系统诊断...${NC}"
     
-    echo -e "\n${GREEN}====== SOCKS5 服务器安装向导 ======${NC}"
+    echo -e "\n${YELLOW}1. 服务状态:${NC}"
+    systemctl status socks5 --no-pager
     
-    # 获取用户输入
-    read -p "请输入端口号 [默认: $DEFAULT_PORT]: " port
-    port=${port:-$DEFAULT_PORT}
+    echo -e "\n${YELLOW}2. 端口监听:${NC}"
+    ss -tulnp | grep -E "microsocks|:$port"
     
-    read -p "请输入用户名 [默认: $DEFAULT_USER]: " user
-    user=${user:-$DEFAULT_USER}
+    echo -e "\n${YELLOW}3. 连接测试:${NC}"
+    timeout 5 curl --socks5 "127.0.0.1:$port" --proxy-user "$user:$pass" -sSf https://ifconfig.co || \
+    echo -e "${RED}连接测试失败!${NC}"
     
-    read -p "请输入密码 [默认: 随机生成]: " pass
-    pass=${pass:-$DEFAULT_PASS}
+    echo -e "\n${YELLOW}4. 最近日志:${NC}"
+    tail -n 20 "$LOG_FILE"
     
-    # 开始安装
-    echo -e "\n${CYAN}开始安装 SOCKS5 服务器...${NC}"
-    install_dependencies "$os_type"
-    install_microsocks
-    
-    create_config "$port" "$user" "$pass"
-    create_service
-    
-    echo -e "\n${GREEN}====== 安装完成 ======${NC}"
-    show_config
+    echo -e "\n${CYAN}诊断完成${NC}"
 }
 
-# 主菜单
-main_menu() {
-    while true; do
-        echo -e "\n${BLUE}======== SOCKS5 服务器管理菜单 ========${NC}"
-        echo -e "1. 安装/重新安装 SOCKS5 服务器"
-        echo -e "2. 修改配置"
-        echo -e "3. 查看当前配置"
-        echo -e "4. 卸载 SOCKS5 服务器"
-        echo -e "5. 退出"
-        
-        read -p "请选择操作 (1-5): " choice
-        
-        case $choice in
-            1)
-                install
-                ;;
-            2)
-                modify_config
-                ;;
-            3)
-                show_config
-                ;;
-            4)
-                uninstall
-                ;;
-            5)
-                echo -e "${GREEN}再见!${NC}"
-                exit 0
-                ;;
-            *)
-                echo -e "${RED}无效选择!${NC}"
-                ;;
-        esac
-    done
-}
-
-# 启动脚本
+# 脚本入口
 clear
-echo -e "${GREEN}=== SOCKS5 服务器管理脚本 v2.1 ===${NC}"
-echo -e "支持: IPv4/IPv6 | 多用户认证"
-echo -e "兼容: Debian/Ubuntu/Alpine\n"
+echo -e "${GREEN}=== SOCKS5服务器一键部署脚本 ===${NC}"
 
-check_root
-main_menu
+case "$1" in
+    install)
+        main_install
+        ;;
+    uninstall)
+        uninstall
+        ;;
+    diagnose)
+        diagnose
+        ;;
+    *)
+        echo -e "使用方法: $0 [command]"
+        echo -e "Commands:"
+        echo -e "  install     - 安装SOCKS5服务器"
+        echo -e "  uninstall   - 完全卸载"
+        echo -e "  diagnose    - 诊断连接问题"
+        exit 1
+        ;;
+esac
