@@ -1,8 +1,8 @@
 #!/bin/bash
 
 # ==============================================
-# SOCKS5 服务器管理脚本 (支持 IPv4/IPv6 + TLS)
-# 版本: 2.0
+# SOCKS5 服务器管理脚本 (支持 IPv4/IPv6)
+# 版本: 2.1
 # 支持系统: Debian/Ubuntu/Alpine
 # ==============================================
 
@@ -55,14 +55,14 @@ install_dependencies() {
     case "$os_type" in
         debian|ubuntu)
             apt-get update
-            apt-get install -y wget curl unzip jq openssl
+            apt-get install -y wget unzip jq
             ;;
         alpine)
             apk update
-            apk add wget curl unzip jq openssl
+            apk add wget unzip jq
             ;;
         *)
-            echo -e "${YELLOW}未知系统，请手动安装依赖: wget curl unzip jq openssl${NC}"
+            echo -e "${YELLOW}未知系统，请手动安装依赖: wget unzip jq${NC}"
             ;;
     esac
 }
@@ -111,64 +111,11 @@ install_microsocks() {
     echo -e "${GREEN}microsocks 安装成功${NC}"
 }
 
-# 安装 simple-tls
-install_simple_tls() {
-    echo -e "${CYAN}正在安装 simple-tls...${NC}"
-    
-    if [ -x "$(command -v simple-tls)" ]; then
-        echo -e "${GREEN}simple-tls 已安装${NC}"
-        return
-    fi
-
-    # 根据架构下载
-    case "$(uname -m)" in
-        x86_64)
-            wget https://github.com/v2fly/simple-tls/releases/download/v0.7.4/simple-tls-linux-amd64.zip -O /tmp/simple-tls.zip
-            ;;
-        aarch64|arm64)
-            wget https://github.com/v2fly/simple-tls/releases/download/v0.7.4/simple-tls-linux-arm64.zip -O /tmp/simple-tls.zip
-            ;;
-        *)
-            echo -e "${RED}不支持的架构: $(uname -m)${NC}"
-            exit 1
-            ;;
-    esac
-
-    unzip /tmp/simple-tls.zip -d /tmp/
-    mv /tmp/simple-tls /usr/local/bin/
-    chmod +x /usr/local/bin/simple-tls
-    rm -f /tmp/simple-tls.zip
-
-    if ! command -v simple-tls &>/dev/null; then
-        echo -e "${RED}simple-tls 安装失败!${NC}"
-        exit 1
-    fi
-    echo -e "${GREEN}simple-tls 安装成功${NC}"
-}
-
-# 生成 TLS 证书
-generate_tls_cert() {
-    echo -e "${CYAN}正在生成 TLS 证书...${NC}"
-    mkdir -p /etc/socks5/tls
-    
-    if ! openssl req -x509 -nodes -days 3650 -newkey rsa:2048 \
-        -keyout /etc/socks5/tls/socks5.key \
-        -out /etc/socks5/tls/socks5.crt \
-        -subj "/CN=socks5-server" &>/dev/null; then
-        echo -e "${RED}TLS 证书生成失败!${NC}"
-        exit 1
-    fi
-    
-    chmod 600 /etc/socks5/tls/*
-    echo -e "${GREEN}TLS 证书生成成功${NC}"
-}
-
 # 创建配置文件
 create_config() {
     local port=$1
     local user=$2
     local pass=$3
-    local use_tls=$4
     
     echo -e "${CYAN}正在创建配置文件...${NC}"
     mkdir -p /etc/socks5
@@ -179,10 +126,7 @@ create_config() {
     "ipv4": "$DEFAULT_IPV4",
     "ipv6": "$DEFAULT_IPV6",
     "username": "$user",
-    "password": "$pass",
-    "tls_enabled": $use_tls,
-    "tls_cert": "/etc/socks5/tls/socks5.crt",
-    "tls_key": "/etc/socks5/tls/socks5.key"
+    "password": "$pass"
 }
 EOF
 
@@ -197,7 +141,6 @@ create_service() {
     local port=$(jq -r '.port' <<< "$config")
     local user=$(jq -r '.username' <<< "$config")
     local pass=$(jq -r '.password' <<< "$config")
-    local tls_enabled=$(jq -r '.tls_enabled' <<< "$config")
     
     cat > "$SERVICE_FILE" <<EOF
 [Unit]
@@ -207,20 +150,7 @@ After=network.target
 [Service]
 Type=simple
 User=root
-ExecStartPre=/bin/sleep 3
-EOF
-
-    if [ "$tls_enabled" = "true" ]; then
-        cat >> "$SERVICE_FILE" <<EOF
-ExecStart=/usr/local/bin/simple-tls -l :${port} -k /etc/socks5/tls/socks5.key -c /etc/socks5/tls/socks5.crt --exec "/usr/local/bin/microsocks -i ${DEFAULT_IPV4} -6 ${DEFAULT_IPV6} -u ${user} -P ${pass}"
-EOF
-    else
-        cat >> "$SERVICE_FILE" <<EOF
 ExecStart=/usr/local/bin/microsocks -i ${DEFAULT_IPV4} -6 ${DEFAULT_IPV6} -p ${port} -u ${user} -P ${pass}
-EOF
-    fi
-
-    cat >> "$SERVICE_FILE" <<EOF
 Restart=always
 RestartSec=10
 StandardOutput=file:${LOG_FILE}
@@ -248,7 +178,6 @@ show_config() {
     local port=$(jq -r '.port' <<< "$config")
     local user=$(jq -r '.username' <<< "$config")
     local pass=$(jq -r '.password' <<< "$config")
-    local tls_enabled=$(jq -r '.tls_enabled' <<< "$config")
     
     local public_ipv4=$(curl -s4 ifconfig.co || echo "未知")
     local public_ipv6=$(curl -s6 ifconfig.co || echo "未知")
@@ -259,19 +188,12 @@ show_config() {
     echo -e "${CYAN}端口:${NC} $port"
     echo -e "${CYAN}用户名:${NC} $user"
     echo -e "${CYAN}密码:${NC} $pass"
-    echo -e "${CYAN}TLS加密:${NC} $tls_enabled"
     
-    if [ "$tls_enabled" = "true" ]; then
-        echo -e "\n${YELLOW}支持TLS的客户端连接格式:${NC}"
-        echo -e "socks5://${user}:${pass}@${public_ipv4}:${port}?tls=true"
-        echo -e "\n${YELLOW}cURL测试命令:${NC}"
-        echo -e "curl --socks5-hostname ${public_ipv4}:${port} --proxy-user ${user}:${pass} --proxy-insecure -k https://example.com"
-    else
-        echo -e "\n${YELLOW}普通客户端连接格式:${NC}"
-        echo -e "socks5://${user}:${pass}@${public_ipv4}:${port}"
-        echo -e "\n${YELLOW}cURL测试命令:${NC}"
-        echo -e "curl --socks5-hostname ${public_ipv4}:${port} --proxy-user ${user}:${pass} https://example.com"
-    fi
+    echo -e "\n${YELLOW}客户端连接格式:${NC}"
+    echo -e "socks5://${user}:${pass}@${public_ipv4}:${port}"
+    
+    echo -e "\n${YELLOW}cURL测试命令:${NC}"
+    echo -e "curl --socks5-hostname ${public_ipv4}:${port} --proxy-user ${user}:${pass} https://example.com"
     
     echo -e "\n${GREEN}===========================================${NC}"
 }
@@ -287,16 +209,14 @@ modify_config() {
     local current_port=$(jq -r '.port' <<< "$config")
     local current_user=$(jq -r '.username' <<< "$config")
     local current_pass=$(jq -r '.password' <<< "$config")
-    local current_tls=$(jq -r '.tls_enabled' <<< "$config")
     
     echo -e "\n${CYAN}当前配置:${NC}"
     echo -e "1. 端口: $current_port"
     echo -e "2. 用户名: $current_user"
     echo -e "3. 密码: $current_pass"
-    echo -e "4. TLS加密: $current_tls"
-    echo -e "5. 返回主菜单"
+    echo -e "4. 返回主菜单"
     
-    read -p "请选择要修改的选项 (1-5): " choice
+    read -p "请选择要修改的选项 (1-4): " choice
     
     case $choice in
         1)
@@ -330,24 +250,6 @@ modify_config() {
             fi
             ;;
         4)
-            local new_tls="false"
-            if [ "$current_tls" = "false" ]; then
-                new_tls="true"
-                generate_tls_cert
-            else
-                echo -e "${YELLOW}禁用 TLS 后连接将不再加密!${NC}"
-                read -p "确定要禁用 TLS 吗? (y/N): " confirm
-                if [[ "$confirm" =~ ^[Yy]$ ]]; then
-                    new_tls="false"
-                else
-                    return
-                fi
-            fi
-            jq ".tls_enabled = $new_tls" "$CONFIG_FILE" > /tmp/socks5_config.tmp && mv /tmp/socks5_config.tmp "$CONFIG_FILE"
-            systemctl restart socks5
-            echo -e "${GREEN}TLS 设置已修改为 $new_tls${NC}"
-            ;;
-        5)
             return
             ;;
         *)
@@ -369,7 +271,6 @@ uninstall() {
     systemctl daemon-reload
     
     rm -f /usr/local/bin/microsocks
-    rm -f /usr/local/bin/simple-tls
     rm -rf /etc/socks5
     rm -f "$LOG_FILE"
     
@@ -393,24 +294,12 @@ install() {
     read -p "请输入密码 [默认: 随机生成]: " pass
     pass=${pass:-$DEFAULT_PASS}
     
-    read -p "启用 TLS 加密? [Y/n]: " tls_answer
-    if [[ "$tls_answer" =~ ^[Nn]$ ]]; then
-        use_tls="false"
-    else
-        use_tls="true"
-    fi
-    
     # 开始安装
     echo -e "\n${CYAN}开始安装 SOCKS5 服务器...${NC}"
     install_dependencies "$os_type"
     install_microsocks
     
-    if [ "$use_tls" = "true" ]; then
-        install_simple_tls
-        generate_tls_cert
-    fi
-    
-    create_config "$port" "$user" "$pass" "$use_tls"
+    create_config "$port" "$user" "$pass"
     create_service
     
     echo -e "\n${GREEN}====== 安装完成 ======${NC}"
@@ -455,8 +344,8 @@ main_menu() {
 
 # 启动脚本
 clear
-echo -e "${GREEN}=== SOCKS5 服务器管理脚本 v2.0 ===${NC}"
-echo -e "支持: IPv4/IPv6 | TLS 加密 | 多用户认证"
+echo -e "${GREEN}=== SOCKS5 服务器管理脚本 v2.1 ===${NC}"
+echo -e "支持: IPv4/IPv6 | 多用户认证"
 echo -e "兼容: Debian/Ubuntu/Alpine\n"
 
 check_root
